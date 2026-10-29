@@ -931,6 +931,11 @@ const SITE_DEFAULTS = {
     },
     bandPerUnit: [1.4, 0.36],   // px of band width per unit of flow rate (and pipe width per unit of capacity)
     wider2: 1.43,              // with two commodities: bands and pipes this much wider
+    taper: {                // the pipes narrow towards their nodes at both ends (walls and bands alike) ...
+      length: [40, 18],     // ... over this many px, at most a third of the edge (0: no taper) ...
+      neck: 0.8,            // ... to this half width at the node, in node radii ...
+      shape: "smooth",       // ... "smooth" S-shaped walls, "round" rounded ends, "cone" straight
+    },
     nodeRadius: [3.2, 2.4],
     nodeStroke: 1.2,
     wallWidth: 0.8,
@@ -1987,7 +1992,29 @@ function layoutTree(tree, { xl, xr, yTop, S, rootY }) {
   }
 
   // ---- Flow -----------------------------------------------------------------
-  // Every edge is a pipe: two walls at distance k * nu_e (its capacity). Inside, a blue
+  // SITE.flow.taper: an edge narrows towards its nodes at both ends. span: the length of each narrowing
+  // part, at(s): the factor on the edge's half width hw at arc length s (1 in between).
+  function taperOf(e, hw, nr) {
+    const T = SITE.flow.taper;
+    const span = T ? Math.min(P(T.length), e.len / 3) : 0, m = T ? Math.min(1, (T.neck * nr) / hw) : 1;
+    if (!(span > 0) || m >= 1) return { span: 0, at: () => 1 };
+    const g = T.shape === 'cone' ? (u) => u : T.shape === 'round' ? (u) => Math.sqrt(1 - (1 - u) * (1 - u)) : (u) => u * u * (3 - 2 * u);
+    return { span, at: (s) => { const d = Math.min(s, e.len - s); return d >= span ? 1 : m + (1 - m) * g(Math.max(0, d) / span); } };
+  }
+  // Arc lengths at which an edge is drawn: about every 5 px, and every 1.5 px where it narrows.
+  function arcSamples(len, span) {
+    const N = Math.max(8, Math.ceil(len / 5)), out = [];
+    for (let i = 0; i <= N; i++) out.push((len * i) / N);
+    if (span > 0) {
+      const M = Math.ceil(span / 1.5);
+      for (let i = 1; i < M; i++) out.push((span * i) / M, len - (span * i) / M);
+      out.sort((a, b) => a - b);
+    }
+    return out;
+  }
+
+  // Every edge is a pipe: two walls at distance k * nu_e (its capacity), narrowing towards its nodes at
+  // both ends (SITE.flow.taper). Inside, a blue
   // band whose width is the flow rate at that point of the edge; flow at arc length s
   // entered the edge at time theta - s * tau_e / length. Wider than the pipe means more
   // flow is on its way than the edge can pass: the walls turn orange, and a point queue
@@ -2015,16 +2042,16 @@ function layoutTree(tree, { xl, xr, yTop, S, rootY }) {
       const z = e.z ? sampleAt(e.z, theta) : 0;
       volume += z;
       if (!visible(e)) continue;
-      const N = Math.max(8, Math.ceil(e.len / 5));
+      const nk = taperOf(e, 0.5 * k * e.nu, nr);
       const pts = [];
       let maxRate = 0, any = false;
-      for (let i = 0; i <= N; i++) {
-        const s = (e.len * i) / N, th = theta - (s * e.tau) / e.len;
+      for (const s of arcSamples(e.len, nk.span)) {
+        const th = theta - (s * e.tau) / e.len;
         const r0 = two && e.gk ? sampleAt(e.gk[0], th) : 0;
         const rate = two && e.gk ? r0 + sampleAt(e.gk[1], th) : e.g ? sampleAt(e.g, th) : 0;
         if (rate > 0.02) any = true;
         if (rate > maxRate) maxRate = rate;
-        pts.push([pointAt(e.tab, s), rate, r0]);
+        pts.push([pointAt(e.tab, s), rate, r0, nk.at(s)]);
       }
 
       // Walls; orange while more flow is on its way than the edge can pass (before the
@@ -2035,11 +2062,11 @@ function layoutTree(tree, { xl, xr, yTop, S, rootY }) {
       // Flow band.
       if (any) {
         const L = [], R = [], M = [];
-        for (const [p, rate, r0] of pts) {
-          const w = 0.5 * k * rate;
+        for (const [p, rate, r0, f] of pts) {
+          const w = 0.5 * k * rate * f;
           L.push([p[0] - p[3] * w, p[1] + p[2] * w - sy]);
           R.push([p[0] + p[3] * w, p[1] - p[2] * w - sy]);
-          if (two) { const o = k * r0 - w; M.push([p[0] + p[3] * o, p[1] - p[2] * o - sy]); }
+          if (two) { const o = k * r0 * f - w; M.push([p[0] + p[3] * o, p[1] - p[2] * o - sy]); }
         }
         const fill = (path, A, B) => {
           path.moveTo(A[0][0], A[0][1]);
@@ -2074,8 +2101,8 @@ function layoutTree(tree, { xl, xr, yTop, S, rootY }) {
       ctx.lineWidth = tollWalls && toll > 0 ? F.toll.width : sat > 0 ? F.wallWidth + F.wallWidthOverload * sat : F.wallWidth;
       for (const side of [1, -1]) {
         ctx.beginPath();
-        pts.forEach(([p], i) => {
-          const x = p[0] - p[3] * hw * side, y = p[1] + p[2] * hw * side - sy;
+        pts.forEach(([p, , , f], i) => {
+          const x = p[0] - p[3] * hw * f * side, y = p[1] + p[2] * hw * f * side - sy;
           if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
         });
         ctx.stroke();
